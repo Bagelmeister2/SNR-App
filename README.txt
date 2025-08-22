@@ -12,7 +12,7 @@ Required Libraries
 2. numpy         — For numerical calculations
 3. matplotlib    — For plotting graphs
 4. plotly        — For interactive charts
-
+5. tkinter       — For Tcl/Tk GUI toolkit
 
 ---------------------------------------------------------
 Installing Python
@@ -48,7 +48,7 @@ Open Command Prompt or PowerShell and run:
 
 2. At the >>> prompt, type:
 
-   >>> import pandas, numpy, matplotlib, plotly
+   >>> import pandas, numpy, matplotlib, plotly, tkinter
    >>> print("All libraries imported successfully!")
 
 3. If you see no errors, you’re ready to run the scripts.
@@ -69,3 +69,4 @@ Optionally, if you want to view or change the code, open IDLE.
 7. Hit F5 to run or Click Run -> Run Module in the toolbar.
 
 =========================================================
+
