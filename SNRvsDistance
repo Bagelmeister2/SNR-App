@@ -1,0 +1,276 @@
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+KM_PER_NMI = 1.852
+
+def w_to_dbm(watts: float) -> float:
+    if watts <= 0:
+        raise ValueError("Transmit power (W) must be > 0.")
+    return 10 * math.log10(watts * 1000.0)
+
+def fspl_db(f_mhz: float, d_km: np.ndarray) -> np.ndarray:
+    return 32.44 + 20.0*np.log10(f_mhz) + 20.0*np.log10(d_km)
+
+def compute_d20_nmi(eirp_dbm, f_mhz, rx_gain_db, rx_cable_loss_db, rx_sens_dbm):
+    """Closed-form distance (nmi) where SNR margin = 20 dB."""
+    pr_target = rx_sens_dbm + 20.0
+    rhs = eirp_dbm + rx_gain_db - rx_cable_loss_db - pr_target - 32.44 - 20.0*math.log10(f_mhz)
+    d_km = 10.0 ** (rhs / 20.0)
+    return d_km / KM_PER_NMI
+
+class DraggablePoint:
+    """A point constrained to the SNR curve, draggable by mouse."""
+    def __init__(self, ax, x_arr, y_arr, x0, label="Draggable point"):
+        self.ax = ax
+        self.canvas = ax.figure.canvas
+        self.x_arr = np.asarray(x_arr)
+        self.y_arr = np.asarray(y_arr)
+        self.dragging = False
+
+        y0 = float(np.interp(x0, self.x_arr, self.y_arr))
+        (self.artist,) = ax.plot([x0], [y0], marker="^", markersize=8, linestyle="None", label=label)
+        self.ann = ax.annotate(
+            f"{y0:.1f} dB @ {x0:.2f} nmi",
+            xy=(x0, y0),
+            xytext=(10, 18),
+            textcoords="offset points",
+            arrowprops=dict(arrowstyle="->", lw=1),
+        )
+
+        self.cids = [
+            self.canvas.mpl_connect("button_press_event", self.on_press),
+            self.canvas.mpl_connect("motion_notify_event", self.on_motion),
+            self.canvas.mpl_connect("button_release_event", self.on_release),
+        ]
+
+    def disconnect(self):
+        for cid in self.cids:
+            self.canvas.mpl_disconnect(cid)
+
+    def _near_point(self, event, pixel_thresh=10):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return False
+        x, y = self.artist.get_data()
+        px, py = self.ax.transData.transform((x[0], y[0]))
+        return math.hypot(event.x - px, event.y - py) <= pixel_thresh
+
+    def on_press(self, event):
+        if self._near_point(event):
+            self.dragging = True
+
+    def on_motion(self, event):
+        if not self.dragging:
+            return
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        # Constrain to curve domain and snap to curve using interpolation
+        x_min, x_max = float(self.x_arr[0]), float(self.x_arr[-1])
+        x_new = float(np.clip(event.xdata, x_min, x_max))
+        y_new = float(np.interp(x_new, self.x_arr, self.y_arr))
+        self.artist.set_data([x_new], [y_new])
+        self.ann.xy = (x_new, y_new)
+        self.ann.set_text(f"{y_new:.1f} dB @ {x_new:.2f} nmi")
+        self.canvas.draw_idle()
+
+    def on_release(self, event):
+        self.dragging = False
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("SNR over Distance (FSPL)")
+        self.geometry("1000x650")
+
+        self.inputs = {
+            "Transmit power (W)": tk.StringVar(value="1.0"),
+            "Tx antenna gain (dBi)": tk.StringVar(value="10"),
+            "Tx cable loss (dB)": tk.StringVar(value="1"),
+            "Frequency (MHz)": tk.StringVar(value="915"),
+            "Rx antenna gain (dBi)": tk.StringVar(value="10"),
+            "Rx cable loss (dB)": tk.StringVar(value="1"),
+            "Rx min sensitivity (dBm)": tk.StringVar(value="-100"),
+            "User distance (nmi)": tk.StringVar(value="50"),
+        }
+
+        self._draggable = None  # will hold DraggablePoint
+        self._build_ui()
+        self._init_plot()
+
+    def _build_ui(self):
+        frm = ttk.Frame(self)
+        frm.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
+
+        for i, (label, var) in enumerate(self.inputs.items()):
+            r, c = divmod(i, 4)
+            sub = ttk.Frame(frm)
+            sub.grid(row=r, column=c, padx=8, pady=4, sticky="w")
+            ttk.Label(sub, text=label).pack(anchor="w")
+            ttk.Entry(sub, textvariable=var, width=14).pack(anchor="w")
+
+        btns = ttk.Frame(self)
+        btns.pack(side=tk.TOP, fill=tk.X, padx=10)
+        ttk.Button(btns, text="Plot", command=self.on_plot).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Save Image", command=self.on_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Quit", command=self.destroy).pack(side=tk.LEFT, padx=6)
+
+        self.fig = plt.Figure(figsize=(10, 4.8), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+    def _init_plot(self):
+        ax = self.fig.add_subplot(111)
+        ax.set_title("SNR (Link Margin) over Distance — Free-Space Path Loss")
+        ax.set_xlabel("Distance (nautical miles)")
+        ax.set_ylabel("SNR Margin relative to Sensitivity (dB)")
+        ax.grid(True, which="both")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _parse(self, key):
+        try:
+            return float(self.inputs[key].get())
+        except ValueError:
+            raise ValueError(f"Invalid number for: {key}")
+
+    def on_save(self):
+        path = filedialog.asksaveasfilename(
+            title="Save plot",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG", "*.png"),
+                ("JPEG", "*.jpg;*.jpeg"),
+                ("PDF", "*.pdf"),
+                ("SVG", "*.svg"),
+            ],
+            initialfile="snr_plot.png",
+        )
+        if not path:
+            return  # user canceled
+
+        try:
+            # Make sure layout is tidy before saving
+            self.fig.tight_layout()
+            # Save at high resolution with a tight bounding box
+            self.fig.savefig(path, dpi=1200, bbox_inches="tight", pad_inches=0.1)
+            messagebox.showinfo("Saved", f"Image saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def on_plot(self):
+        # Clean up old draggable callbacks if present
+        if self._draggable is not None:
+            self._draggable.disconnect()
+            self._draggable = None
+
+        try:
+            tx_w = self._parse("Transmit power (W)")
+            tx_gain = self._parse("Tx antenna gain (dBi)")
+            tx_loss = self._parse("Tx cable loss (dB)")
+            f_mhz = self._parse("Frequency (MHz)")
+            rx_gain = self._parse("Rx antenna gain (dBi)")
+            rx_loss = self._parse("Rx cable loss (dB)")
+            rx_sens = self._parse("Rx min sensitivity (dBm)")
+            user_nmi = max(0.001, self._parse("User distance (nmi)"))
+            if f_mhz <= 0:
+                raise ValueError("Frequency must be > 0.")
+        except Exception as e:
+            messagebox.showerror("Input error", str(e))
+            return
+
+        try:
+            pt_dbm = w_to_dbm(tx_w)
+        except Exception as e:
+            messagebox.showerror("Input error", str(e))
+            return
+
+        eirp_dbm = pt_dbm + tx_gain - tx_loss
+        d20_nmi = compute_d20_nmi(eirp_dbm, f_mhz, rx_gain, rx_loss, rx_sens)
+        xmax_nmi = max(user_nmi + 10.0, d20_nmi + 0.1)
+        d_nmi = np.linspace(0.1, xmax_nmi, 1200)
+        d_km = d_nmi * KM_PER_NMI
+
+        Lfs = fspl_db(f_mhz, d_km)
+        pr_dbm = eirp_dbm - Lfs + rx_gain - rx_loss
+        snr_margin = pr_dbm - rx_sens
+
+        # Rebuild axes each time
+        self.fig.clf()
+        ax = self.fig.add_subplot(111)
+
+        # Main curve and shading
+        ax.plot(d_nmi, snr_margin, label="SNR (Margin) vs Distance")
+        ax.fill_between(d_nmi, snr_margin, 0, where=(snr_margin >= 0), alpha=0.15, label="≥ 0 dB margin")
+
+        # Guides
+        ax.axhline(0, linestyle="--", linewidth=0.8)
+        ax.axhline(20, linestyle="--", linewidth=0.8)
+
+        # SNR=20 dB vertical
+        if d20_nmi > 0:
+            ax.axvline(d20_nmi, linestyle=":", linewidth=1.2, label=f"SNR=20 dB @ {d20_nmi:.2f} nmi")
+            ax.plot([d20_nmi], [20.0], marker="o")
+            ax.annotate(f"20 dB @ {d20_nmi:.2f} nmi",
+                        xy=(d20_nmi, 20.0), xytext=(8, 12), textcoords="offset points",
+                        arrowprops=dict(arrowstyle="->", lw=1))
+
+        # User distance vertical
+        y_user = float(np.interp(user_nmi, d_nmi, snr_margin))
+        ax.axvline(user_nmi, linestyle="-.", linewidth=1.2, label=f"User dist. @ {user_nmi:.2f} nmi")
+        ax.plot([user_nmi], [y_user], marker="s")
+        ax.annotate(f"{y_user:.1f} dB @ {user_nmi:.2f} nmi",
+                    xy=(user_nmi, y_user), xytext=(8, 12), textcoords="offset points",
+                    arrowprops=dict(arrowstyle="->", lw=1))
+
+        # Draggable point (third point) — starts at the user distance
+        self._draggable = DraggablePoint(ax, d_nmi, snr_margin, x0=user_nmi, label="Draggable point")
+
+        # Axes and secondary x-axis
+        ax.set_title("SNR (Link Margin) over Distance")
+        ax.set_xlabel("Distance (nmi)")
+        ax.set_ylabel("SNR margin relative to sensitivity (dB)")
+        ax.grid(True, which="both")
+
+        def nmi_to_km(x): return x * KM_PER_NMI
+        def km_to_nmi(x): return x / KM_PER_NMI
+        ax2 = ax.secondary_xaxis('top', functions=(nmi_to_km, km_to_nmi))
+        ax2.set_xlabel("Distance (km)")
+
+        # Parameter textbox
+        textbox = (f"EIRP: {eirp_dbm:.1f} dBm\n"
+                   f"f = {f_mhz:.3f} MHz\n"
+                   f"Tx gain/loss: +{tx_gain:.1f} / -{tx_loss:.1f} dB\n"
+                   f"Rx gain/loss: +{rx_gain:.1f} / -{rx_loss:.1f} dB\n"
+                   f"Sensitivity: {rx_sens:.1f} dBm\n"
+                   f"SNR=20 dB @ {d20_nmi:.2f} nmi")
+        #self.fig.text(0.012, 0.02, textbox, fontsize=9, family="monospace")
+        leg = ax.legend(loc="best")
+        
+        # Get the bounding box of the legend in axes coordinates
+        bbox = leg.get_window_extent()
+        bbox = bbox.transformed(ax.transAxes.inverted())
+
+        # Find bottom-left corner of legend box
+        x0, y0 = bbox.x0, bbox.y0
+
+        # Place textbox just below it (shift y downward a bit)
+        ax.text(
+            x0, y0 - 0.001, textbox,
+            transform=ax.transAxes,
+            va="top", ha="left",
+            fontsize=9, family="monospace",
+            bbox=dict(facecolor="white", alpha=0.6, edgecolor="none")
+        )
+
+
+        ax.legend(loc="best")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+if __name__ == "__main__":
+    App().mainloop()
